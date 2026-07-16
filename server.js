@@ -114,17 +114,69 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.use(express.static(path.join(__dirname, "public")));
 
-// ---- realtime push ----
+// ---- realtime push + video-call signaling ----
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
+
+// map of username -> Set of that user's live sockets (they may have several tabs)
+const peers = new Map();
+function addPeer(username, ws) {
+  if (!peers.has(username)) peers.set(username, new Set());
+  peers.get(username).add(ws);
+}
+function removePeer(username, ws) {
+  const set = peers.get(username);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) peers.delete(username);
+}
+function sendToUser(username, msg) {
+  const set = peers.get(username);
+  if (!set) return false;
+  const data = JSON.stringify(msg);
+  let delivered = false;
+  for (const ws of set) if (ws.readyState === 1) { ws.send(data); delivered = true; }
+  return delivered;
+}
+
 function broadcast(msg) {
   const data = JSON.stringify(msg);
   for (const ws of wss.clients) if (ws.readyState === 1) ws.send(data);
 }
+
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({ type: "hello" }));
-  ws.on("message", () => {});
+  ws.username = null;
+
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    // client announces who it is so we can route calls to it
+    if (msg.type === "register" && msg.from) {
+      if (ws.username) removePeer(ws.username, ws);
+      ws.username = String(msg.from);
+      addPeer(ws.username, ws);
+      return;
+    }
+
+    // signaling messages: call-offer / call-answer / ice / call-end / call-decline
+    // each carries {to, from, ...}; we relay to the target user's sockets.
+    if (["call-offer", "call-answer", "ice", "call-end", "call-decline", "call-cancel"].includes(msg.type) && msg.to) {
+      const ok = sendToUser(msg.to, msg);
+      // if the callee isn't connected, tell the caller it failed
+      if (!ok && msg.type === "call-offer" && msg.from) {
+        sendToUser(msg.from, { type: "call-unavailable", to: msg.to });
+      }
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    if (ws.username) removePeer(ws.username, ws);
+  });
 });
+
 
 initDb()
   .then(() => {
