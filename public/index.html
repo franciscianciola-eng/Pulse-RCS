@@ -35,6 +35,8 @@ Error generating stack: `+f.message+`
       red: "#D64550",
     },
     STROKE = 1.6,
+    SELECTED_BG = "rgba(43,95,217,0.16)",
+    HOVER_BG = "rgba(122,128,137,0.16)",
     Icon = ({
       d,
       size = 22,
@@ -270,6 +272,25 @@ Error generating stack: `+f.message+`
           }),
           ...p,
         }),
+      users: (p) =>
+        import_react.default.createElement(Icon, {
+          d: "M2 20 C2 16.9 4.7 15 8 15 C11.3 15 14 16.9 14 20 M15.6 15.3 C18.7 15.7 21 17.5 21 20",
+          extra: import_react.default.createElement(
+            import_react.default.Fragment,
+            null,
+            import_react.default.createElement("circle", {
+              cx: "8",
+              cy: "8.5",
+              r: "3.8",
+            }),
+            import_react.default.createElement("circle", {
+              cx: "16.6",
+              cy: "9",
+              r: "2.9",
+            }),
+          ),
+          ...p,
+        }),
     };
   async function sGet(key, shared = !0) {
     try {
@@ -305,6 +326,10 @@ Error generating stack: `+f.message+`
     presenceKey = (u) => `rcspresence:${u}`,
     incognitoKey = (a, b) =>
       `rcsincognito:${[normUser(a), normUser(b)].sort().join("__")}`,
+    groupKey = (id) => `rcsgroup:${id}`,
+    groupChatKey = (id) => `rcsgroupchat:${id}`,
+    newGroupId = () =>
+      "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
     CRYPTO = (() => {
       let enc = new TextEncoder(),
         dec = new TextDecoder(),
@@ -429,6 +454,23 @@ Error generating stack: `+f.message+`
           return null;
         }
       }
+      async function createGroupSecret() {
+        let key = await subtle().generateKey(
+          { name: "AES-GCM", length: 256 },
+          !0,
+          ["encrypt", "decrypt"],
+        );
+        return b64(await subtle().exportKey("raw", key));
+      }
+      function importGroupSecret(secretB64) {
+        return subtle().importKey(
+          "raw",
+          unb64(secretB64),
+          { name: "AES-GCM" },
+          !1,
+          ["encrypt", "decrypt"],
+        );
+      }
       let available = () => !!subtle();
       async function rewrapPrivateKey(identity, oldPassword, newPassword) {
         let oldWrapKey = await keyFromPassword(
@@ -464,8 +506,74 @@ Error generating stack: `+f.message+`
         passwordVerifier,
         randomSaltB64,
         rewrapPrivateKey,
+        createGroupSecret,
+        importGroupSecret,
       };
     })();
+  async function wrapGroupSecret(myKey, member, secretB64) {
+    let pair = await CRYPTO.sharedKey(myKey, member.publicKey);
+    return await CRYPTO.encryptWith(pair, secretB64);
+  }
+  async function unwrapGroupSecret(myKey, group, username) {
+    let entry = group.keys?.[normUser(username)];
+    if (!entry) return null;
+    let wrapper = await sGet(userKey(normUser(entry.by)));
+    if (!wrapper?.publicKey) return null;
+    let pair = await CRYPTO.sharedKey(myKey, wrapper.publicKey),
+      secret = await CRYPTO.decryptWith(pair, { iv: entry.iv, ct: entry.ct });
+    return secret
+      ? { secret, key: await CRYPTO.importGroupSecret(secret) }
+      : null;
+  }
+  async function createGroup(me, myKey, name, memberUsers) {
+    let seen = new Set(),
+      everyone = [me, ...memberUsers].filter((u) => {
+        let n = normUser(u?.username);
+        return u?.publicKey && !seen.has(n) && (seen.add(n), !0);
+      });
+    if (!seen.has(normUser(me.username)))
+      throw new Error("no encryption key for this account");
+    if (everyone.length < 2) throw new Error("nobody to add");
+    let id = newGroupId(),
+      secret = await CRYPTO.createGroupSecret(),
+      keys = {};
+    for (let u of everyone) {
+      let enc = await wrapGroupSecret(myKey, u, secret);
+      keys[normUser(u.username)] = { by: normUser(me.username), ...enc };
+    }
+    let group = {
+      id,
+      name: name.trim() || "New group",
+      createdBy: normUser(me.username),
+      createdAt: Date.now(),
+      members: everyone.map((u) => normUser(u.username)),
+      keys,
+    };
+    return (
+      await sSet(groupKey(id), group),
+      await sSet(groupChatKey(id), {
+        messages: [
+          {
+            id: "sys-" + Date.now().toString(36),
+            ts: Date.now(),
+            system: !0,
+            text: `${me.displayName} started \u201C${group.name}\u201D`,
+          },
+        ],
+      }),
+      group
+    );
+  }
+  async function myGroups(username) {
+    let me = normUser(username),
+      keys = await sList("rcsgroup:"),
+      out = [];
+    for (let k of keys) {
+      let g = await sGet(k);
+      g?.members?.map(normUser).includes(me) && out.push(g);
+    }
+    return out;
+  }
   function statusFromLastActive(lastActive) {
     if (!lastActive) return "offline";
     let mins = (Date.now() - lastActive) / 6e4;
@@ -544,6 +652,31 @@ Error generating stack: `+f.message+`
         },
         name.slice(0, 2).toUpperCase(),
       ),
+    GroupAvatar = ({ name, size = 40, active = !1 }) =>
+      import_react.default.createElement(
+        "div",
+        {
+          style: {
+            width: size,
+            height: size,
+            borderRadius: size * 0.3,
+            flexShrink: 0,
+            border: `${STROKE}px solid ${active ? T.blue : T.ink}`,
+            background: T.paper,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontWeight: 600,
+            fontSize: size * 0.34,
+            color: active ? T.blue : T.ink,
+            letterSpacing: 0.5,
+          },
+        },
+        String(name || "?")
+          .trim()
+          .slice(0, 2)
+          .toUpperCase(),
+      ),
     RcsTag = () =>
       import_react.default.createElement(
         "span",
@@ -554,13 +687,15 @@ Error generating stack: `+f.message+`
             gap: 4,
             border: `${STROKE}px solid ${T.ink}`,
             borderRadius: 6,
-            padding: "1px 7px",
-            fontSize: 10,
+            padding: "1px 6px",
+            fontSize: 9.5,
             fontWeight: 700,
-            letterSpacing: 1.5,
+            letterSpacing: 1.2,
+            flexShrink: 0,
+            whiteSpace: "nowrap",
           },
         },
-        import_react.default.createElement(I.bolt, { size: 11 }),
+        import_react.default.createElement(I.bolt, { size: 10 }),
         " RCS",
       ),
     LineBtn = ({
@@ -862,20 +997,30 @@ Error generating stack: `+f.message+`
   }
   function Home({
     me,
+    myKey,
     onOpenChat,
+    onOpenGroup,
     onIncognito,
     onOpenSettings,
     activePeer,
+    activeGroup,
     onLogout,
   }) {
     let [users, setUsers] = (0, import_react.useState)([]),
+      [groups, setGroups] = (0, import_react.useState)([]),
       [previews, setPreviews] = (0, import_react.useState)({}),
+      [groupPreviews, setGroupPreviews] = (0, import_react.useState)({}),
       [presence, setPresence] = (0, import_react.useState)({}),
       [search, setSearch] = (0, import_react.useState)(""),
       [addName, setAddName] = (0, import_react.useState)(""),
       [addMsg, setAddMsg] = (0, import_react.useState)(null),
       [addBusy, setAddBusy] = (0, import_react.useState)(!1),
       [showAdd, setShowAdd] = (0, import_react.useState)(!1),
+      [showNewGroup, setShowNewGroup] = (0, import_react.useState)(!1),
+      [groupName, setGroupName] = (0, import_react.useState)(""),
+      [groupPicks, setGroupPicks] = (0, import_react.useState)([]),
+      [groupBusy, setGroupBusy] = (0, import_react.useState)(!1),
+      [groupMsg, setGroupMsg] = (0, import_react.useState)(null),
       [directory, setDirectory] = (0, import_react.useState)(null),
       [notifyPerm, setNotifyPerm] = (0, import_react.useState)(
         NOTIFY.permission(),
@@ -935,6 +1080,33 @@ Error generating stack: `+f.message+`
           pres[u.username] = p?.lastActive || 0;
         }
         setPresence(pres);
+        let mine = await myGroups(me.username);
+        setGroups(mine);
+        let gprev = {},
+          nameCache = {};
+        for (let g of mine) {
+          let chat = await sGet(groupChatKey(g.id));
+          if (chat && chat.messages.length) {
+            let last = chat.messages[chat.messages.length - 1],
+              sender = normUser(last.from);
+            if (!last.system && sender !== meNorm && !(sender in nameCache))
+              nameCache[sender] =
+                (await sGet(userKey(sender)))?.displayName || "@" + sender;
+            gprev[g.id] = {
+              text: last.system
+                ? last.text
+                : `${sender === meNorm ? "You" : nameCache[sender]}: ${last.hasImage || last.image ? "Photo" : "Message"}`,
+              ts: last.ts,
+              unread: chat.messages.filter(
+                (m) =>
+                  !m.system &&
+                  normUser(m.from) !== meNorm &&
+                  !(m.readBy || []).map(normUser).includes(meNorm),
+              ).length,
+            };
+          }
+        }
+        setGroupPreviews(gprev);
       }, [me.username]);
     (0, import_react.useEffect)(() => {
       refresh();
@@ -982,16 +1154,175 @@ Error generating stack: `+f.message+`
           setConfirmDelete(null),
           refresh());
       },
-      filtered = users
-        .filter(
-          (u) =>
-            u.username.includes(search.toLowerCase()) ||
-            u.displayName.toLowerCase().includes(search.toLowerCase()),
-        )
-        .sort(
-          (a, b) =>
-            (previews[b.username]?.ts || 0) - (previews[a.username]?.ts || 0),
+      toggleGroupPick = (username) => {
+        let n = normUser(username);
+        (setGroupMsg(null),
+          setGroupPicks((picks) =>
+            picks.includes(n) ? picks.filter((x) => x !== n) : [...picks, n],
+          ));
+      },
+      startGroup = async () => {
+        if ((setGroupMsg(null), groupPicks.length === 0))
+          return setGroupMsg({
+            ok: !1,
+            text: "Pick at least one contact for the group.",
+          });
+        if (!myKey || !CRYPTO.available())
+          return setGroupMsg({
+            ok: !1,
+            text: "Encryption isn't ready \u2014 sign in again and retry.",
+          });
+        setGroupBusy(!0);
+        try {
+          let picked = users.filter((u) =>
+            groupPicks.includes(normUser(u.username)),
+          );
+          if (picked.length !== groupPicks.length)
+            return (
+              setGroupBusy(!1),
+              setGroupMsg({
+                ok: !1,
+                text: "One of those contacts couldn't be loaded. Try again.",
+              })
+            );
+          let group = await createGroup(me, myKey, groupName, picked);
+          (setGroupBusy(!1),
+            setGroupName(""),
+            setGroupPicks([]),
+            setShowNewGroup(!1),
+            setGroupMsg(null),
+            refresh(),
+            onOpenGroup(group));
+        } catch {
+          (setGroupBusy(!1),
+            setGroupMsg({
+              ok: !1,
+              text: "Couldn't create the group. Try again.",
+            }));
+        }
+      },
+      q = search.trim().toLowerCase(),
+      filtered = users.filter(
+        (u) =>
+          u.username.includes(q) || u.displayName.toLowerCase().includes(q),
+      ),
+      filteredGroups = groups.filter((g) =>
+        (g.name || "").toLowerCase().includes(q),
+      ),
+      rows = [
+        ...filteredGroups.map((g) => ({
+          kind: "group",
+          key: "g:" + g.id,
+          item: g,
+          ts: groupPreviews[g.id]?.ts || g.createdAt || 0,
+        })),
+        ...filtered.map((u) => ({
+          kind: "user",
+          key: "u:" + u.username,
+          item: u,
+          ts: previews[u.username]?.ts || 0,
+        })),
+      ].sort((a, b) => b.ts - a.ts),
+      renderGroupRow = (g) => {
+        let p = groupPreviews[g.id],
+          isActive = activeGroup && activeGroup.id === g.id,
+          count = (g.members || []).length;
+        return import_react.default.createElement(
+          "div",
+          {
+            key: "g:" + g.id,
+            role: "button",
+            "aria-label": `Open group ${g.name}`,
+            onClick: () => onOpenGroup(g),
+            style: {
+              display: "flex",
+              gap: 12,
+              alignItems: "center",
+              padding: "12px 18px",
+              cursor: "pointer",
+              borderBottom: `1px solid ${T.line}`,
+              background: isActive ? SELECTED_BG : "transparent",
+            },
+            onMouseEnter: (e) => {
+              isActive || (e.currentTarget.style.background = HOVER_BG);
+            },
+            onMouseLeave: (e) => {
+              isActive || (e.currentTarget.style.background = "transparent");
+            },
+          },
+          import_react.default.createElement(GroupAvatar, {
+            name: g.name,
+            active: isActive,
+          }),
+          import_react.default.createElement(
+            "div",
+            { style: { flex: 1, minWidth: 0 } },
+            import_react.default.createElement(
+              "div",
+              {
+                style: {
+                  fontWeight: 600,
+                  fontSize: 15,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  minWidth: 0,
+                },
+              },
+              import_react.default.createElement(
+                "span",
+                {
+                  style: {
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  },
+                },
+                g.name,
+              ),
+              import_react.default.createElement(I.users, {
+                size: 14,
+                color: T.muted,
+              }),
+            ),
+            import_react.default.createElement(
+              "div",
+              {
+                style: {
+                  color: T.muted,
+                  fontSize: 13,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                },
+              },
+              p ? p.text : `${count} member${count === 1 ? "" : "s"}`,
+            ),
+          ),
+          p?.unread > 0 &&
+            import_react.default.createElement(
+              "div",
+              {
+                style: {
+                  border: `${STROKE}px solid ${T.blue}`,
+                  color: T.blue,
+                  borderRadius: 999,
+                  minWidth: 22,
+                  height: 22,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  padding: "0 6px",
+                  boxSizing: "border-box",
+                  flexShrink: 0,
+                },
+              },
+              p.unread,
+            ),
         );
+      };
     return import_react.default.createElement(
       "div",
       {
@@ -1010,73 +1341,105 @@ Error generating stack: `+f.message+`
             borderBottom: `${STROKE}px solid ${T.ink}`,
             display: "flex",
             alignItems: "center",
-            gap: 12,
+            gap: 9,
+            minWidth: 0,
           },
         },
         import_react.default.createElement(Avatar, {
           name: me.displayName,
+          size: 36,
           accent: !0,
         }),
         import_react.default.createElement(
           "div",
-          { style: { flex: 1, minWidth: 0 } },
+          { style: { flex: 1, minWidth: 0, overflow: "hidden" } },
           import_react.default.createElement(
             "div",
             {
               style: {
                 fontWeight: 700,
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
               },
+              title: me.displayName,
             },
             me.displayName,
-            " ",
-            import_react.default.createElement(RcsTag, null),
           ),
           import_react.default.createElement(
             "div",
-            { style: { color: T.muted, fontSize: 12 } },
-            "@",
-            me.username,
+            {
+              style: {
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                minWidth: 0,
+              },
+            },
+            import_react.default.createElement(
+              "span",
+              {
+                style: {
+                  color: T.muted,
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                },
+              },
+              "@",
+              me.username,
+            ),
+            import_react.default.createElement(RcsTag, null),
           ),
         ),
         import_react.default.createElement(
-          LineBtn,
+          "div",
           {
-            onClick: async () => {
-              let p = await NOTIFY.request();
-              setNotifyPerm(p);
+            style: {
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              flexShrink: 0,
             },
-            round: !0,
-            label: "Enable notifications",
-            color: notifyPerm === "granted" ? T.green : T.ink,
-            style: { width: 40, height: 40 },
           },
-          import_react.default.createElement(I.bell, {
-            size: 18,
-            color: notifyPerm === "granted" ? T.green : T.ink,
-          }),
-        ),
-        import_react.default.createElement(
-          LineBtn,
-          {
-            onClick: onOpenSettings,
-            round: !0,
-            label: "Settings",
-            style: { width: 40, height: 40 },
-          },
-          import_react.default.createElement(I.gear, { size: 18 }),
-        ),
-        import_react.default.createElement(
-          LineBtn,
-          {
-            onClick: onLogout,
-            round: !0,
-            label: "Sign out",
-            style: { width: 40, height: 40 },
-          },
-          import_react.default.createElement(I.logout, { size: 18 }),
+          import_react.default.createElement(
+            LineBtn,
+            {
+              onClick: async () => {
+                let p = await NOTIFY.request();
+                setNotifyPerm(p);
+              },
+              round: !0,
+              label: "Enable notifications",
+              color: notifyPerm === "granted" ? T.green : T.ink,
+              style: { width: 34, height: 34, flexShrink: 0 },
+            },
+            import_react.default.createElement(I.bell, {
+              size: 17,
+              color: notifyPerm === "granted" ? T.green : T.ink,
+            }),
+          ),
+          import_react.default.createElement(
+            LineBtn,
+            {
+              onClick: onOpenSettings,
+              round: !0,
+              label: "Settings",
+              style: { width: 34, height: 34, flexShrink: 0 },
+            },
+            import_react.default.createElement(I.gear, { size: 17 }),
+          ),
+          import_react.default.createElement(
+            LineBtn,
+            {
+              onClick: onLogout,
+              round: !0,
+              label: "Sign out",
+              style: { width: 34, height: 34, flexShrink: 0 },
+            },
+            import_react.default.createElement(I.logout, { size: 17 }),
+          ),
         ),
       ),
       import_react.default.createElement(
@@ -1090,23 +1453,156 @@ Error generating stack: `+f.message+`
           },
         },
         import_react.default.createElement(
-          LineBtn,
-          {
-            onClick: () => {
-              (setShowAdd((s) => !s),
-                setAddMsg(null),
-                showAdd || loadDirectory());
+          "div",
+          { style: { display: "flex", gap: 10 } },
+          import_react.default.createElement(
+            LineBtn,
+            {
+              onClick: () => {
+                (setShowAdd((s) => !s),
+                  setAddMsg(null),
+                  setShowNewGroup(!1),
+                  showAdd || loadDirectory());
+              },
+              color: T.blue,
+              label: "Add contact",
+              style: { flex: 1, minWidth: 0, padding: "9px 10px" },
             },
-            color: T.blue,
-            label: "Add contact",
-            style: { width: "100%" },
-          },
-          import_react.default.createElement(I.addUser, {
-            size: 18,
-            color: T.blue,
-          }),
-          " Add contact",
+            import_react.default.createElement(I.addUser, {
+              size: 18,
+              color: T.blue,
+            }),
+            " Add contact",
+          ),
+          import_react.default.createElement(
+            LineBtn,
+            {
+              onClick: () => {
+                (setShowNewGroup((v) => !v), setGroupMsg(null), setShowAdd(!1));
+              },
+              color: T.ink,
+              label: "New group",
+              style: { flex: 1, minWidth: 0, padding: "9px 10px" },
+            },
+            import_react.default.createElement(I.users, { size: 18 }),
+            " New group",
+          ),
         ),
+        showNewGroup &&
+          import_react.default.createElement(
+            import_react.default.Fragment,
+            null,
+            import_react.default.createElement(Input, {
+              autoFocus: !0,
+              placeholder: "Group name",
+              value: groupName,
+              onChange: (e) => {
+                (setGroupName(e.target.value), setGroupMsg(null));
+              },
+              onKeyDown: (e) => e.key === "Enter" && startGroup(),
+            }),
+            import_react.default.createElement(
+              "div",
+              { style: { fontSize: 12, color: T.muted } },
+              users.length === 0
+                ? "Add a contact first \u2014 groups are built from your contacts."
+                : "Tap the contacts to include.",
+            ),
+            users.length > 0 &&
+              import_react.default.createElement(
+                "div",
+                {
+                  style: {
+                    border: `${STROKE}px solid ${T.line}`,
+                    borderRadius: 10,
+                    maxHeight: 180,
+                    overflowY: "auto",
+                  },
+                },
+                users.map((u) => {
+                  let picked = groupPicks.includes(normUser(u.username));
+                  return import_react.default.createElement(
+                    "div",
+                    {
+                      key: u.username,
+                      role: "button",
+                      "aria-pressed": picked,
+                      "aria-label": `Include ${u.displayName} in the group`,
+                      onClick: () => toggleGroupPick(u.username),
+                      style: {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        padding: "8px 12px",
+                        cursor: "pointer",
+                        borderBottom: `1px solid ${T.line}`,
+                        background: picked ? SELECTED_BG : "transparent",
+                      },
+                    },
+                    import_react.default.createElement(Avatar, {
+                      name: u.displayName,
+                      size: 28,
+                      accent: picked,
+                    }),
+                    import_react.default.createElement(
+                      "div",
+                      {
+                        style: {
+                          fontSize: 13,
+                          flex: 1,
+                          minWidth: 0,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        },
+                      },
+                      import_react.default.createElement(
+                        "b",
+                        null,
+                        u.displayName,
+                      ),
+                      " ",
+                      import_react.default.createElement(
+                        "span",
+                        { style: { color: T.muted } },
+                        "@",
+                        u.username,
+                      ),
+                    ),
+                    picked &&
+                      import_react.default.createElement(I.check, {
+                        size: 16,
+                        color: T.blue,
+                      }),
+                  );
+                }),
+              ),
+            groupMsg &&
+              import_react.default.createElement(
+                "div",
+                {
+                  style: {
+                    fontSize: 12,
+                    color: groupMsg.ok ? T.green : T.red,
+                  },
+                },
+                groupMsg.text,
+              ),
+            import_react.default.createElement(
+              LineBtn,
+              {
+                onClick: startGroup,
+                disabled: groupBusy || groupPicks.length === 0,
+                filled: !0,
+                color: T.blue,
+                label: "Create group",
+                style: { width: "100%" },
+              },
+              groupBusy
+                ? "Creating\u2026"
+                : `Create group${groupPicks.length ? ` (${groupPicks.length + 1})` : ""}`,
+            ),
+          ),
         showAdd &&
           import_react.default.createElement(
             import_react.default.Fragment,
@@ -1219,7 +1715,7 @@ Error generating stack: `+f.message+`
                             borderBottom: `1px solid ${T.line}`,
                           },
                           onMouseEnter: (e) =>
-                            (e.currentTarget.style.background = "#F0F1ED"),
+                            (e.currentTarget.style.background = HOVER_BG),
                           onMouseLeave: (e) =>
                             (e.currentTarget.style.background = "transparent"),
                         },
@@ -1282,7 +1778,7 @@ Error generating stack: `+f.message+`
       import_react.default.createElement(
         "div",
         { style: { flex: 1, overflowY: "auto", minHeight: 0 } },
-        filtered.length === 0 &&
+        rows.length === 0 &&
           import_react.default.createElement(
             "div",
             {
@@ -1294,18 +1790,22 @@ Error generating stack: `+f.message+`
                 lineHeight: 1.6,
               },
             },
-            "No contacts yet.",
+            "No chats yet.",
             import_react.default.createElement("br", null),
-            "Add someone by their username above \u2014 they just need an account in this app, on any device or network.",
+            "Add someone by their username above \u2014 they just need an account in this app, on any device or network. Then start a group with any of them.",
           ),
-        filtered.map((u) => {
-          let p = previews[u.username],
+        rows.map((row) => {
+          if (row.kind === "group") return renderGroupRow(row.item);
+          let u = row.item,
+            p = previews[u.username],
             status = statusFromLastActive(presence[u.username]),
             isActive = activePeer && activePeer.username === u.username;
           return import_react.default.createElement(
             "div",
             {
               key: u.username,
+              role: "button",
+              "aria-label": `Open chat with ${u.displayName}`,
               onClick: () => onOpenChat(u),
               style: {
                 display: "flex",
@@ -1314,10 +1814,10 @@ Error generating stack: `+f.message+`
                 padding: "12px 18px",
                 cursor: "pointer",
                 borderBottom: `1px solid ${T.line}`,
-                background: isActive ? "#E7EBF6" : "transparent",
+                background: isActive ? SELECTED_BG : "transparent",
               },
               onMouseEnter: (e) => {
-                isActive || (e.currentTarget.style.background = "#F0F1ED");
+                isActive || (e.currentTarget.style.background = HOVER_BG);
               },
               onMouseLeave: (e) => {
                 isActive || (e.currentTarget.style.background = "transparent");
@@ -3053,11 +3553,794 @@ Error generating stack: `+f.message+`
       ),
     );
   }
+  function GroupChatView({ me, myKey, group: initialGroup, onBack, onLeave }) {
+    let [group, setGroup] = (0, import_react.useState)(initialGroup),
+      [messages, setMessages] = (0, import_react.useState)([]),
+      [people, setPeople] = (0, import_react.useState)({}),
+      [contacts, setContacts] = (0, import_react.useState)([]),
+      [draft, setDraft] = (0, import_react.useState)(""),
+      [reactingTo, setReactingTo] = (0, import_react.useState)(null),
+      [lightbox, setLightbox] = (0, import_react.useState)(null),
+      [uploading, setUploading] = (0, import_react.useState)(!1),
+      [showMembers, setShowMembers] = (0, import_react.useState)(!1),
+      [locked, setLocked] = (0, import_react.useState)(!1),
+      bottomRef = (0, import_react.useRef)(null),
+      fileRef = (0, import_react.useRef)(null),
+      secretRef = (0, import_react.useRef)(null),
+      peopleSigRef = (0, import_react.useRef)(""),
+      key = groupChatKey(initialGroup.id),
+      meNorm = normUser(me.username),
+      members = (group.members || []).map(normUser),
+      others = members.filter((n) => n !== meNorm),
+      nameOf = (n) => people[normUser(n)]?.displayName || "@" + n;
+    let decryptMsg = (0, import_react.useCallback)(async (m) => {
+        if (m.system || !m.enc || !secretRef.current) return m;
+        let out = await CRYPTO.decryptWith(secretRef.current.key, m.enc);
+        if (out === null) return { ...m, text: "\u{1F512} (can't decrypt)" };
+        try {
+          let payload = JSON.parse(out);
+          return { ...m, text: payload.text, image: payload.image };
+        } catch {
+          return { ...m, text: out };
+        }
+      }, []),
+      load = (0, import_react.useCallback)(async () => {
+        let fresh = await sGet(groupKey(initialGroup.id));
+        if (fresh) {
+          setGroup(fresh);
+          let sig = (fresh.members || []).join(",");
+          if (sig !== peopleSigRef.current) {
+            peopleSigRef.current = sig;
+            let dir = {};
+            for (let n of fresh.members || []) {
+              let u = await sGet(userKey(normUser(n)));
+              u && (dir[normUser(n)] = u);
+            }
+            setPeople(dir);
+          }
+        }
+        let msgs = (await sGet(key))?.messages || [],
+          dirty = !1;
+        for (let m of msgs)
+          !m.system &&
+            m.from !== me.username &&
+            ((m.readBy = m.readBy || []),
+            m.readBy.includes(me.username) ||
+              (m.readBy.push(me.username), (dirty = !0)));
+        dirty && (await sSet(key, { messages: msgs }));
+        let shown = await Promise.all(msgs.map(decryptMsg));
+        setMessages(shown);
+      }, [key, me.username, decryptMsg, initialGroup.id]);
+    ((0, import_react.useEffect)(() => {
+      let cancelled = !1;
+      return (
+        (async () => {
+          if (!myKey || !CRYPTO.available()) return;
+          let unwrapped = await unwrapGroupSecret(myKey, group, me.username);
+          cancelled ||
+            ((secretRef.current = unwrapped), setLocked(!unwrapped), load());
+        })(),
+        () => {
+          cancelled = !0;
+        }
+      );
+    }, [initialGroup.id, myKey]),
+      (0, import_react.useEffect)(() => {
+        load();
+        let id = setInterval(load, 2500),
+          onRemote = () => load();
+        return (
+          window.addEventListener("pulse-remote-change", onRemote),
+          () => {
+            (clearInterval(id),
+              window.removeEventListener("pulse-remote-change", onRemote));
+          }
+        );
+      }, [load]),
+      (0, import_react.useEffect)(() => {
+        bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, [messages.length]),
+      (0, import_react.useEffect)(() => {
+        if (!showMembers) return;
+        let cancelled = !1;
+        return (
+          (async () => {
+            let stored = (await sGet(contactsKey(me.username))) || [],
+              list = [];
+            for (let n of stored) {
+              let u = await sGet(userKey(normUser(n)));
+              u && list.push(u);
+            }
+            cancelled || setContacts(list);
+          })(),
+          () => {
+            cancelled = !0;
+          }
+        );
+      }, [showMembers, me.username]));
+    let pushSystem = async (text) => {
+        let chat = (await sGet(key)) || { messages: [] };
+        (chat.messages.push({
+          id:
+            "sys-" +
+            Date.now().toString(36) +
+            Math.random().toString(36).slice(2, 5),
+          ts: Date.now(),
+          system: !0,
+          text,
+        }),
+          await sSet(key, chat));
+      },
+      pushMessage = async (content) => {
+        let chat = (await sGet(key)) || { messages: [] },
+          base = {
+            id: Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+            from: me.username,
+            ts: Date.now(),
+            readBy: [],
+            reactions: {},
+          };
+        if (secretRef.current) {
+          let enc = await CRYPTO.encryptWith(
+            secretRef.current.key,
+            JSON.stringify(content),
+          );
+          chat.messages.push({ ...base, enc, hasImage: !!content.image });
+        } else chat.messages.push({ ...base, ...content });
+        (chat.messages.length > 200 &&
+          (chat.messages = chat.messages.slice(-200)),
+          await sSet(key, chat),
+          load());
+      },
+      send = async () => {
+        let text = draft.trim();
+        text && (setDraft(""), await pushMessage({ text }));
+      },
+      onPickImage = async (e) => {
+        let file = e.target.files?.[0];
+        if (
+          ((e.target.value = ""), !(!file || !file.type.startsWith("image/")))
+        ) {
+          setUploading(!0);
+          try {
+            let dataUrl = await compressImage(file);
+            (dataUrl.length > 14e5 &&
+              (dataUrl = await compressImage(file, 900, 0.55)),
+              await pushMessage({ image: dataUrl }));
+          } catch {
+          } finally {
+            setUploading(!1);
+          }
+        }
+      },
+      react = async (msgId, emoji) => {
+        setReactingTo(null);
+        let chat = (await sGet(key)) || { messages: [] },
+          msg = chat.messages.find((m) => m.id === msgId);
+        if (!msg) return;
+        msg.reactions = msg.reactions || {};
+        let who = msg.reactions[emoji] || [];
+        (who.includes(me.username)
+          ? ((msg.reactions[emoji] = who.filter((u) => u !== me.username)),
+            msg.reactions[emoji].length === 0 && delete msg.reactions[emoji])
+          : (msg.reactions[emoji] = [...who, me.username]),
+          await sSet(key, chat),
+          load());
+      },
+      addMember = async (u) => {
+        let g = await sGet(groupKey(group.id));
+        if (!g || !secretRef.current || !u.publicKey) return;
+        let n = normUser(u.username);
+        if ((g.members || []).map(normUser).includes(n)) return;
+        try {
+          let enc = await wrapGroupSecret(myKey, u, secretRef.current.secret);
+          ((g.members = [...(g.members || []), n]),
+            (g.keys = { ...(g.keys || {}), [n]: { by: meNorm, ...enc } }),
+            await sSet(groupKey(g.id), g),
+            setGroup(g),
+            await pushSystem(`${me.displayName} added ${u.displayName}`),
+            load());
+        } catch {}
+      },
+      leave = async () => {
+        let g = await sGet(groupKey(group.id));
+        if (g) {
+          ((g.members = (g.members || []).filter(
+            (x) => normUser(x) !== meNorm,
+          )),
+            g.keys && delete g.keys[meNorm],
+            await pushSystem(`${me.displayName} left the group`));
+          if (g.members.length === 0) {
+            try {
+              await window.storage.delete(groupKey(g.id), !0);
+            } catch {}
+            try {
+              await window.storage.delete(groupChatKey(g.id), !0);
+            } catch {}
+          } else await sSet(groupKey(g.id), g);
+        }
+        onLeave();
+      },
+      canAdd = contacts.filter((u) => !members.includes(normUser(u.username)));
+    return import_react.default.createElement(
+      "div",
+      {
+        style: {
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          minHeight: 0,
+          position: "relative",
+          background: T.paper,
+        },
+      },
+      import_react.default.createElement(
+        "header",
+        {
+          style: {
+            padding: "10px 14px",
+            borderBottom: `${STROKE}px solid ${T.ink}`,
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            minWidth: 0,
+          },
+        },
+        import_react.default.createElement(
+          "button",
+          {
+            onClick: onBack,
+            "aria-label": "Back",
+            style: {
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              padding: "4px 6px",
+              display: "flex",
+              flexShrink: 0,
+            },
+          },
+          import_react.default.createElement(I.back, { size: 20 }),
+        ),
+        import_react.default.createElement(GroupAvatar, {
+          name: group.name,
+          size: 36,
+        }),
+        import_react.default.createElement(
+          "div",
+          { style: { flex: 1, minWidth: 0, overflow: "hidden" } },
+          import_react.default.createElement(
+            "div",
+            {
+              style: {
+                fontWeight: 700,
+                fontSize: 15,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              },
+              title: group.name,
+            },
+            group.name,
+          ),
+          import_react.default.createElement(
+            "div",
+            {
+              style: {
+                color: T.green,
+                fontSize: 10.5,
+                fontWeight: 700,
+                letterSpacing: 1,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              },
+            },
+            `${members.length} MEMBER${members.length === 1 ? "" : "S"} \xB7 GROUP RCS`,
+          ),
+        ),
+        import_react.default.createElement(
+          LineBtn,
+          {
+            onClick: () => setShowMembers((v) => !v),
+            round: !0,
+            label: "Group members",
+            color: showMembers ? T.blue : T.ink,
+            style: { width: 38, height: 38, flexShrink: 0 },
+          },
+          import_react.default.createElement(I.users, {
+            size: 19,
+            color: showMembers ? T.blue : T.ink,
+          }),
+        ),
+      ),
+      showMembers &&
+        import_react.default.createElement(
+          "div",
+          {
+            style: {
+              borderBottom: `${STROKE}px solid ${T.line}`,
+              padding: "12px 14px",
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+              maxHeight: "45%",
+              overflowY: "auto",
+            },
+          },
+          import_react.default.createElement(
+            "div",
+            {
+              style: {
+                fontSize: 11,
+                fontWeight: 700,
+                letterSpacing: 1,
+                color: T.muted,
+              },
+            },
+            "IN THIS GROUP",
+          ),
+          import_react.default.createElement(
+            "div",
+            { style: { display: "flex", flexWrap: "wrap", gap: 8 } },
+            members.map((n) =>
+              import_react.default.createElement(
+                "div",
+                {
+                  key: n,
+                  style: {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    border: `1px solid ${T.line}`,
+                    borderRadius: 999,
+                    padding: "3px 10px 3px 4px",
+                    fontSize: 13,
+                  },
+                },
+                import_react.default.createElement(Avatar, {
+                  name: nameOf(n),
+                  size: 22,
+                  accent: n === meNorm,
+                }),
+                n === meNorm ? "You" : nameOf(n),
+              ),
+            ),
+          ),
+          canAdd.length > 0 &&
+            import_react.default.createElement(
+              import_react.default.Fragment,
+              null,
+              import_react.default.createElement(
+                "div",
+                {
+                  style: {
+                    fontSize: 11,
+                    fontWeight: 700,
+                    letterSpacing: 1,
+                    color: T.muted,
+                    marginTop: 4,
+                  },
+                },
+                "ADD FROM YOUR CONTACTS",
+              ),
+              import_react.default.createElement(
+                "div",
+                { style: { display: "flex", flexWrap: "wrap", gap: 8 } },
+                canAdd.map((u) =>
+                  import_react.default.createElement(
+                    LineBtn,
+                    {
+                      key: u.username,
+                      onClick: () => addMember(u),
+                      color: T.blue,
+                      label: `Add ${u.displayName} to the group`,
+                      style: { padding: "5px 12px", fontSize: 13 },
+                    },
+                    import_react.default.createElement(I.plus, {
+                      size: 14,
+                      color: T.blue,
+                    }),
+                    " ",
+                    u.displayName,
+                  ),
+                ),
+              ),
+            ),
+          import_react.default.createElement(
+            LineBtn,
+            {
+              onClick: leave,
+              color: T.red,
+              label: "Leave group",
+              style: {
+                alignSelf: "flex-start",
+                padding: "6px 12px",
+                fontSize: 13,
+              },
+            },
+            import_react.default.createElement(I.logout, {
+              size: 15,
+              color: T.red,
+            }),
+            " Leave group",
+          ),
+        ),
+      locked &&
+        import_react.default.createElement(
+          "div",
+          {
+            style: {
+              padding: "10px 14px",
+              background: "#FBF1F1",
+              color: T.red,
+              fontSize: 12.5,
+              borderBottom: `1px solid ${T.line}`,
+            },
+          },
+          "This group's key can't be unlocked on this account, so messages stay encrypted.",
+        ),
+      import_react.default.createElement(
+        "div",
+        {
+          style: {
+            flex: 1,
+            overflowY: "auto",
+            padding: "16px 14px",
+            minHeight: 0,
+          },
+          onClick: () => setReactingTo(null),
+        },
+        messages.length === 0 &&
+          import_react.default.createElement(
+            "div",
+            {
+              style: {
+                color: T.muted,
+                textAlign: "center",
+                fontSize: 13,
+                marginTop: 30,
+              },
+            },
+            "Say hi to the group.",
+          ),
+        messages.map((m, i) => {
+          if (m.system)
+            return import_react.default.createElement(
+              "div",
+              {
+                key: m.id,
+                style: {
+                  textAlign: "center",
+                  color: T.muted,
+                  fontSize: 11.5,
+                  margin: "10px 0",
+                },
+              },
+              m.text,
+            );
+          let mine = m.from === me.username,
+            read =
+              others.length > 0 &&
+              others.every((n) => (m.readBy || []).map(normUser).includes(n)),
+            prev = messages[i - 1],
+            gap = !prev || m.ts - prev.ts > 300 * 1e3,
+            showAuthor =
+              !mine && (!prev || prev.system || prev.from !== m.from || gap),
+            reactionEntries = Object.entries(m.reactions || {}).filter(
+              ([, u]) => u.length > 0,
+            );
+          return import_react.default.createElement(
+            import_react.default.Fragment,
+            { key: m.id },
+            gap &&
+              import_react.default.createElement(
+                "div",
+                {
+                  style: {
+                    textAlign: "center",
+                    color: T.muted,
+                    fontSize: 11,
+                    margin: "14px 0 8px",
+                  },
+                },
+                new Date(m.ts).toLocaleString([], {
+                  month: "short",
+                  day: "numeric",
+                  hour: "numeric",
+                  minute: "2-digit",
+                }),
+              ),
+            import_react.default.createElement(
+              "div",
+              {
+                style: {
+                  display: "flex",
+                  justifyContent: mine ? "flex-end" : "flex-start",
+                  marginBottom: reactionEntries.length ? 18 : 7,
+                },
+              },
+              import_react.default.createElement(
+                "div",
+                { style: { position: "relative", maxWidth: "78%" } },
+                showAuthor &&
+                  import_react.default.createElement(
+                    "div",
+                    {
+                      style: {
+                        fontSize: 11.5,
+                        fontWeight: 700,
+                        color: T.muted,
+                        margin: "0 0 3px 4px",
+                      },
+                    },
+                    nameOf(m.from),
+                  ),
+                import_react.default.createElement(
+                  "div",
+                  {
+                    onClick: (e) => {
+                      (e.stopPropagation(),
+                        setReactingTo(reactingTo === m.id ? null : m.id));
+                    },
+                    style: {
+                      background: T.paper,
+                      color: T.ink,
+                      border: `${STROKE}px solid ${mine ? T.blue : T.ink}`,
+                      borderRadius: mine
+                        ? "14px 14px 4px 14px"
+                        : "14px 14px 14px 4px",
+                      padding: m.image ? 5 : "9px 13px",
+                      fontSize: 14.5,
+                      lineHeight: 1.45,
+                      wordBreak: "break-word",
+                      overflow: "hidden",
+                      cursor: "pointer",
+                    },
+                  },
+                  m.image &&
+                    import_react.default.createElement("img", {
+                      src: m.image,
+                      alt: "shared",
+                      onClick: (e) => {
+                        (e.stopPropagation(), setLightbox(m.image));
+                      },
+                      style: {
+                        display: "block",
+                        maxWidth: "100%",
+                        maxHeight: 320,
+                        borderRadius: 10,
+                        cursor: "pointer",
+                      },
+                    }),
+                  m.text &&
+                    import_react.default.createElement(
+                      "div",
+                      { style: { padding: m.image ? "6px 8px 2px" : 0 } },
+                      m.text,
+                    ),
+                  import_react.default.createElement(
+                    "div",
+                    {
+                      style: {
+                        fontSize: 10.5,
+                        color: T.muted,
+                        marginTop: 4,
+                        padding: m.image ? "0 8px 4px" : 0,
+                        display: "flex",
+                        justifyContent: "flex-end",
+                        alignItems: "center",
+                        gap: 4,
+                      },
+                    },
+                    fmtTime(m.ts),
+                    mine &&
+                      (read
+                        ? import_react.default.createElement(I.checkCheck, {
+                            size: 13,
+                            color: T.green,
+                          })
+                        : import_react.default.createElement(I.check, {
+                            size: 13,
+                            color: T.muted,
+                          })),
+                  ),
+                ),
+                reactionEntries.length > 0 &&
+                  import_react.default.createElement(
+                    "div",
+                    {
+                      style: {
+                        position: "absolute",
+                        bottom: -14,
+                        [mine ? "right" : "left"]: 8,
+                        display: "flex",
+                        gap: 4,
+                      },
+                    },
+                    reactionEntries.map(([emoji, users]) =>
+                      import_react.default.createElement(
+                        "div",
+                        {
+                          key: emoji,
+                          onClick: (e) => {
+                            (e.stopPropagation(), react(m.id, emoji));
+                          },
+                          title: users.join(", "),
+                          style: {
+                            background: T.paper,
+                            border: `1px solid ${users.includes(me.username) ? T.blue : T.line}`,
+                            borderRadius: 999,
+                            padding: "1px 6px",
+                            fontSize: 12,
+                            cursor: "pointer",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 3,
+                            boxShadow: "0 1px 2px rgba(0,0,0,0.06)",
+                          },
+                        },
+                        import_react.default.createElement("span", null, emoji),
+                        users.length > 1 &&
+                          import_react.default.createElement(
+                            "span",
+                            { style: { color: T.muted, fontSize: 11 } },
+                            users.length,
+                          ),
+                      ),
+                    ),
+                  ),
+                reactingTo === m.id &&
+                  import_react.default.createElement(
+                    "div",
+                    {
+                      onClick: (e) => e.stopPropagation(),
+                      style: {
+                        position: "absolute",
+                        top: -46,
+                        [mine ? "right" : "left"]: 0,
+                        background: T.paper,
+                        border: `${STROKE}px solid ${T.ink}`,
+                        borderRadius: 999,
+                        padding: "4px 8px",
+                        display: "flex",
+                        gap: 6,
+                        zIndex: 5,
+                        boxShadow: "0 3px 10px rgba(0,0,0,0.12)",
+                      },
+                    },
+                    REACTIONS.map((emoji) =>
+                      import_react.default.createElement(
+                        "span",
+                        {
+                          key: emoji,
+                          onClick: () => react(m.id, emoji),
+                          style: {
+                            fontSize: 20,
+                            cursor: "pointer",
+                            lineHeight: 1,
+                          },
+                        },
+                        emoji,
+                      ),
+                    ),
+                  ),
+              ),
+            ),
+          );
+        }),
+        import_react.default.createElement("div", { ref: bottomRef }),
+      ),
+      import_react.default.createElement(
+        "div",
+        {
+          style: {
+            padding: 12,
+            borderTop: `${STROKE}px solid ${T.ink}`,
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+          },
+        },
+        import_react.default.createElement("input", {
+          ref: fileRef,
+          type: "file",
+          accept: "image/*",
+          onChange: onPickImage,
+          style: { display: "none" },
+        }),
+        import_react.default.createElement(
+          LineBtn,
+          {
+            onClick: () => fileRef.current?.click(),
+            round: !0,
+            label: "Send image",
+            disabled: uploading,
+            style: { width: 44, height: 44, flexShrink: 0 },
+          },
+          import_react.default.createElement(I.image, { size: 20 }),
+        ),
+        import_react.default.createElement("input", {
+          placeholder: uploading
+            ? "Sending image\u2026"
+            : `Message ${group.name} \xB7 RCS`,
+          value: draft,
+          onChange: (e) => setDraft(e.target.value),
+          onKeyDown: (e) => e.key === "Enter" && send(),
+          style: {
+            flex: 1,
+            minWidth: 0,
+            background: "transparent",
+            border: `${STROKE}px solid ${T.ink}`,
+            borderRadius: 999,
+            color: T.ink,
+            padding: "10px 16px",
+            fontSize: 14.5,
+            fontFamily: "inherit",
+            outline: "none",
+          },
+          onFocus: (e) => (e.target.style.borderColor = T.blue),
+          onBlur: (e) => (e.target.style.borderColor = T.ink),
+        }),
+        import_react.default.createElement(
+          LineBtn,
+          {
+            onClick: send,
+            round: !0,
+            color: T.blue,
+            label: "Send",
+            style: { width: 44, height: 44, flexShrink: 0 },
+          },
+          import_react.default.createElement(I.send, {
+            size: 19,
+            color: T.blue,
+          }),
+        ),
+      ),
+      lightbox &&
+        import_react.default.createElement(
+          "div",
+          {
+            onClick: () => setLightbox(null),
+            style: {
+              position: "fixed",
+              inset: 0,
+              background: "rgba(20,22,25,0.92)",
+              zIndex: 60,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: 20,
+            },
+          },
+          import_react.default.createElement("img", {
+            src: lightbox,
+            alt: "full size",
+            style: { maxWidth: "100%", maxHeight: "100%", borderRadius: 10 },
+          }),
+          import_react.default.createElement(
+            "div",
+            {
+              style: {
+                position: "absolute",
+                top: 18,
+                right: 20,
+                color: "#fff",
+                fontSize: 14,
+                opacity: 0.8,
+              },
+            },
+            "Tap anywhere to close",
+          ),
+        ),
+    );
+  }
   function App() {
     let [me, setMe] = (0, import_react.useState)(null),
       [myKey, setMyKey] = (0, import_react.useState)(null),
       [view, setView] = (0, import_react.useState)("auth"),
       [peer, setPeer] = (0, import_react.useState)(null),
+      [group, setGroup] = (0, import_react.useState)(null),
       [callRole, setCallRole] = (0, import_react.useState)(null),
       [incoming, setIncoming] = (0, import_react.useState)(null),
       [incomingOffer, setIncomingOffer] = (0, import_react.useState)(null),
@@ -3163,6 +4446,30 @@ Error generating stack: `+f.message+`
                       }
                   }
                 }
+                for (let g of await myGroups(me.username)) {
+                  let chat = await sGet(groupChatKey(g.id));
+                  if (chat?.messages)
+                    for (let msg of chat.messages)
+                      if (
+                        !msg.system &&
+                        normUser(msg.from) !== normUser(me.username) &&
+                        msg.ts > seenTs
+                      ) {
+                        let name =
+                            (await sGet(userKey(normUser(msg.from))))
+                              ?.displayName || msg.from,
+                          body =
+                            msg.hasImage || msg.image
+                              ? "Sent a photo"
+                              : "New encrypted message";
+                        (NOTIFY.show(
+                          `${name} \u2022 ${g.name}`,
+                          body,
+                          "pulse-group-" + g.id,
+                        ),
+                          msg.ts > newest && (newest = msg.ts));
+                      }
+                }
                 seenTs = Math.max(seenTs, newest);
               } catch {}
           },
@@ -3218,7 +4525,11 @@ Error generating stack: `+f.message+`
           (await window.storage.delete("rcssession", !1),
             window.sessionStorage.removeItem("rcs-pw"));
         } catch {}
-        (setMe(null), setMyKey(null), setView("auth"));
+        (setMe(null),
+          setMyKey(null),
+          setPeer(null),
+          setGroup(null),
+          setView("auth"));
       },
       startCall = (u) => {
         (setPeer(u), setCallRole("caller"), setView("video"));
@@ -3279,16 +4590,21 @@ Error generating stack: `+f.message+`
             },
             import_react.default.createElement(Home, {
               me,
+              myKey,
               activePeer: view === "chat" || view === "incognito" ? peer : null,
+              activeGroup: view === "group" ? group : null,
               onLogout: logout,
               onOpenSettings: () => setView("settings"),
               onOpenChat: (u) => {
                 u
-                  ? (setPeer(u), setView("chat"))
+                  ? (setGroup(null), setPeer(u), setView("chat"))
                   : (setPeer(null), setView("home"));
               },
+              onOpenGroup: (g) => {
+                (setPeer(null), setGroup(g), setView("group"));
+              },
               onIncognito: (u) => {
-                (setPeer(u), setView("incognito"));
+                (setGroup(null), setPeer(u), setView("incognito"));
               },
             }),
           ),
@@ -3311,76 +4627,93 @@ Error generating stack: `+f.message+`
                   onLogout: logout,
                   onUpdateMe: setMe,
                 })
-              : (view === "chat" || view === "incognito") && peer
-                ? import_react.default.createElement(ChatView, {
+              : view === "group" && group
+                ? import_react.default.createElement(GroupChatView, {
+                    key: group.id,
                     me,
                     myKey,
-                    peer,
-                    incognito: view === "incognito",
+                    group,
                     onBack: () => {
-                      (setPeer(null), setView("home"));
+                      (setGroup(null), setView("home"));
                     },
-                    onVideo: () => startCall(peer),
+                    onLeave: () => {
+                      (setGroup(null), setView("home"));
+                    },
                   })
-                : import_react.default.createElement(
-                    "div",
-                    {
-                      style: {
-                        flex: 1,
-                        display: "flex",
-                        flexDirection: "column",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        gap: 14,
-                        color: T.muted,
-                        padding: 30,
-                        textAlign: "center",
+                : (view === "chat" || view === "incognito") && peer
+                  ? import_react.default.createElement(ChatView, {
+                      me,
+                      myKey,
+                      peer,
+                      incognito: view === "incognito",
+                      onBack: () => {
+                        (setPeer(null), setView("home"));
                       },
-                    },
-                    import_react.default.createElement(
-                      "svg",
-                      {
-                        width: "72",
-                        height: "56",
-                        viewBox: "0 0 84 64",
-                        fill: "none",
-                        stroke: T.line,
-                        strokeWidth: STROKE,
-                        strokeLinecap: "round",
-                        strokeLinejoin: "round",
-                      },
-                      import_react.default.createElement("path", {
-                        d: "M6 8 H50 V34 H20 L10 43 V34 H6 Z",
-                      }),
-                      import_react.default.createElement("path", {
-                        d: "M34 22 H78 V48 H74 V57 L64 48 H34 V38",
-                        stroke: T.blue,
-                      }),
-                    ),
-                    import_react.default.createElement(
-                      "div",
-                      {
-                        style: { fontWeight: 700, fontSize: 18, color: T.ink },
-                      },
-                      "Pick a contact to start chatting",
-                    ),
-                    import_react.default.createElement(
+                      onVideo: () => startCall(peer),
+                    })
+                  : import_react.default.createElement(
                       "div",
                       {
                         style: {
-                          fontSize: 13,
+                          flex: 1,
                           display: "flex",
+                          flexDirection: "column",
                           alignItems: "center",
-                          gap: 6,
+                          justifyContent: "center",
+                          gap: 14,
+                          color: T.muted,
+                          padding: 30,
+                          textAlign: "center",
                         },
                       },
-                      import_react.default.createElement(I.lock, {
-                        size: 14,
-                        color: T.muted,
-                      }),
-                      " Messages are end-to-end encrypted",
+                      import_react.default.createElement(
+                        "svg",
+                        {
+                          width: "72",
+                          height: "56",
+                          viewBox: "0 0 84 64",
+                          fill: "none",
+                          stroke: T.line,
+                          strokeWidth: STROKE,
+                          strokeLinecap: "round",
+                          strokeLinejoin: "round",
+                        },
+                        import_react.default.createElement("path", {
+                          d: "M6 8 H50 V34 H20 L10 43 V34 H6 Z",
+                        }),
+                        import_react.default.createElement("path", {
+                          d: "M34 22 H78 V48 H74 V57 L64 48 H34 V38",
+                          stroke: T.blue,
+                        }),
+                      ),
+                      import_react.default.createElement(
+                        "div",
+                        {
+                          style: {
+                            fontWeight: 700,
+                            fontSize: 18,
+                            color: T.ink,
+                          },
+                        },
+                        "Pick a chat to start messaging",
+                      ),
+                      import_react.default.createElement(
+                        "div",
+                        {
+                          style: {
+                            fontSize: 13,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                          },
+                        },
+                        import_react.default.createElement(I.lock, {
+                          size: 14,
+                          color: T.muted,
+                        }),
+                        " Messages are end-to-end encrypted",
+                      ),
                     ),
-                  ),
           ),
         ),
       view === "video" &&
