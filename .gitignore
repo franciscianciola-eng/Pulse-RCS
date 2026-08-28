@@ -1,0 +1,4 @@
+node_modules/
+package-lock.json
+pulse-local.db*
+.env
